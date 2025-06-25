@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+/**
+ * @title HFV Staking Contract
+ * @dev Stake HFV tokens to earn based on HFV × 0.4 × 17.38 (695% APY)
+ * - Auto-pulls rewards from MF
+ * - If MF is low, auto-pulls shortfall from PSF
+ */
+contract HFVStaking is Ownable {
+    IERC20 public immutable hfvToken;
+
+    address public constant mfAddress = 0x9caAfb42977C70f5496174930fe2AD1e8436cd22;
+    address public constant psfAddress = 0x74b6E88C895f7398304A04508D91f8f48ce11768;
+
+    uint256 public constant MULTIPLIER = 4 * 1738; // 0.4 * 17.38 * 10000
+    uint256 public constant PRECISION = 10000;
+    uint256 public constant MIN_LOCK_DAYS = 21;
+
+    struct Stake {
+        uint256 amount;
+        uint256 startTime;
+        bool claimed;
+    }
+
+    mapping(address => Stake) public stakes;
+
+    constructor(address _token) Ownable(msg.sender) {
+        require(_token != address(0), "Invalid token address");
+        hfvToken = IERC20(_token);
+    }
+
+    function stake(uint256 amount) external {
+        require(stakes[msg.sender].amount == 0, "Already staked");
+        require(amount > 0, "Amount must be > 0");
+
+        hfvToken.transferFrom(msg.sender, address(this), amount);
+
+        stakes[msg.sender] = Stake({
+            amount: amount,
+            startTime: block.timestamp,
+            claimed: false
+        });
+    }
+
+    function calculateReward(address user) public view returns (uint256) {
+        Stake memory s = stakes[user];
+        if (s.amount == 0) return 0;
+
+        uint256 daysStaked = (block.timestamp - s.startTime) / 1 days;
+        if (daysStaked < MIN_LOCK_DAYS) return 0;
+
+        return (s.amount * MULTIPLIER) / PRECISION;
+    }
+
+    function claim() external {
+        Stake storage s = stakes[msg.sender];
+        require(s.amount > 0, "Nothing staked");
+        require(!s.claimed, "Already claimed");
+
+        uint256 reward = calculateReward(msg.sender);
+        require(reward > 0, "Stake not matured");
+
+        s.claimed = true;
+
+        uint256 mfBalance = hfvToken.balanceOf(mfAddress);
+        uint256 psfBalance = hfvToken.balanceOf(psfAddress);
+
+        // Auto-top-up MF from PSF if needed
+        if (mfBalance < reward && psfBalance >= (reward - mfBalance)) {
+            require(
+                hfvToken.transferFrom(psfAddress, mfAddress, reward - mfBalance),
+                "PSF top-up failed"
+            );
+        }
+
+        // Final payout from MF
+        require(hfvToken.balanceOf(mfAddress) >= reward, "Insufficient MF balance");
+        require(hfvToken.transferFrom(mfAddress, msg.sender, reward), "Reward transfer failed");
+    }
+}
